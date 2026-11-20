@@ -37,6 +37,7 @@ import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Permission } from "@opencode/core/permission"
 import { SubagentTool } from "@opencode/core/tool/plugin/subagent"
+import { CollaborationTools } from "@opencode/core/tool/plugin/collaboration"
 import { Tool } from "@opencode/core/tool"
 import { tmpdirScoped } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
@@ -122,6 +123,7 @@ const subagentPluginSupervisor = makeLocationNode({
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
       yield* registerToolPlugin(SubagentTool.Plugin, {}, (name, callback) => hooks.register("tool", name, callback))
+      yield* registerToolPlugin(CollaborationTools.Plugin)
     }),
   ),
   deps: [
@@ -1188,6 +1190,171 @@ describe("SubagentTool reporting", () => {
       expect(reports[0]?.text).toContain(`<subagent sessionID="${childID}" state="error"`)
       expect(reports[0]?.text).toContain("provider exploded")
     }),
+  )
+})
+
+describe("CollaborationTools", () => {
+  it.live("coordinates nested agents by session ID and canonical or relative path", () =>
+    tmpdirScoped().pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const root = yield* sessions.create({
+            location: Location.Ref.make({ directory: AbsolutePath.make(dir.path) }),
+            model: parentModel,
+          })
+          yield* withSubagent(root.location)
+          const locations = yield* LocationServiceMap.Service
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(root.location)))
+          const child = yield* sessions.create({
+            parentID: root.id,
+            agent: Agent.ID.make("reviewer"),
+            model: childModel,
+          })
+          const grandchild = yield* sessions.create({
+            parentID: child.id,
+            agent: Agent.ID.make("reviewer"),
+            model: childModel,
+          })
+          const foreign = yield* sessions.create({ location: root.location, agent: Agent.ID.make("reviewer") })
+          const call = (name: string, input: unknown, caller = root.id) =>
+            executeTool(registry, {
+              sessionID: caller,
+              ...toolIdentity,
+              call: { type: "tool-call", id: `call-${name}`, name: `collaboration_${name}`, input },
+            })
+          const list = yield* call("list_agents", {})
+          expect(list.status).toBe("completed")
+          expect(list.output.agents).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ session_id: root.id, parent_id: null, agent_name: "/root", status: "idle" }),
+              expect.objectContaining({ session_id: child.id, parent_id: root.id, agent_name: `/root/${child.id}` }),
+              expect.objectContaining({
+                session_id: grandchild.id,
+                parent_id: child.id,
+                agent_name: `/root/${child.id}/${grandchild.id}`,
+              }),
+            ]),
+          )
+          expect(list.output.agents).toHaveLength(3)
+          expect((yield* call("list_agents", { path_prefix: grandchild.id }, child.id)).output.agents).toHaveLength(1)
+          expect(
+            (yield* call("send_input", {
+              target: `/root/${child.id}/${grandchild.id}`,
+              message: "Continue nested work",
+            })).output,
+          ).toEqual({ session_id: grandchild.id, result_recipient: child.id })
+          expect(yield* sessions.get(grandchild.id)).toMatchObject({
+            parentID: child.id,
+            agent: "reviewer",
+            model: childModel,
+          })
+          expect(yield* sessions.inbox(grandchild.id)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                type: "user",
+                payload: expect.objectContaining({ text: "Continue nested work" }),
+              }),
+            ]),
+          )
+          const waited = yield* call("wait_agent", { targets: [grandchild.id] })
+          expect(waited.output).toMatchObject({
+            timed_out: false,
+            result: { session_id: grandchild.id, status: "idle", output: childText },
+          })
+          expect((yield* call("interrupt_agent", { target: grandchild.id }, child.id)).output).toEqual({
+            session_id: grandchild.id,
+            interrupted: false,
+          })
+          expect(yield* call("send_message", { target: foreign.id, message: "Outside tree" })).toMatchObject({
+            status: "error",
+            error: { message: "Target is not in the current agent tree." },
+          })
+        }),
+      ),
+    ),
+  )
+
+  it.live("queues messages to ancestors without resuming them", () =>
+    tmpdirScoped().pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const root = yield* sessions.create({
+            location: Location.Ref.make({ directory: AbsolutePath.make(dir.path) }),
+            model: parentModel,
+          })
+          yield* withSubagent(root.location)
+          const child = yield* sessions.create({ parentID: root.id, agent: Agent.ID.make("reviewer") })
+          const locations = yield* LocationServiceMap.Service
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(root.location)))
+          const result = yield* executeTool(registry, {
+            sessionID: child.id,
+            ...toolIdentity,
+            call: {
+              type: "tool-call",
+              id: "message-parent",
+              name: "collaboration_send_message",
+              input: { target: "parent", message: "Review result" },
+            },
+          })
+          expect(result.status).toBe("completed")
+          expect(result.output.session_id).toBe(root.id)
+          const inbox = yield* sessions.inbox(root.id)
+          expect(inbox).toHaveLength(1)
+          expect(inbox[0]).toMatchObject({
+            type: "synthetic",
+            delivery: "steer",
+            payload: {
+              text: `<agent-message from="${child.id}">\nReview result\n</agent-message>`,
+              metadata: { source: "agent-message", senderID: child.id },
+            },
+          })
+          expect(yield* sessions.context(root.id)).toHaveLength(0)
+          expect((yield* sessions.active).size).toBe(0)
+        }),
+      ),
+    ),
+  )
+
+  it.live("checks target agent permissions before admitting follow-ups or messages", () =>
+    tmpdirScoped().pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const root = yield* sessions.create({
+            location: Location.Ref.make({ directory: AbsolutePath.make(dir.path) }),
+          })
+          yield* withSubagent(root.location)
+          const child = yield* sessions.create({ parentID: root.id, agent: Agent.ID.make("reviewer") })
+          yield* sessions.setPermissions({
+            sessionID: root.id,
+            permissions: [
+              { action: "subagent", resource: "reviewer", effect: "deny" },
+              { action: "collaboration_send_message", resource: "reviewer", effect: "deny" },
+            ],
+          })
+          const locations = yield* LocationServiceMap.Service
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(root.location)))
+          for (const name of ["send_input", "send_message"]) {
+            expect(
+              yield* executeTool(registry, {
+                sessionID: root.id,
+                ...toolIdentity,
+                call: {
+                  type: "tool-call",
+                  id: `denied-${name}`,
+                  name: `collaboration_${name}`,
+                  input: { target: child.id, message: "Denied work" },
+                },
+              }),
+            ).toMatchObject({ status: "error" })
+          }
+          expect(yield* sessions.inbox(child.id)).toHaveLength(0)
+          expect(yield* sessions.context(child.id)).toHaveLength(0)
+        }),
+      ),
+    ),
   )
 })
 

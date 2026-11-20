@@ -90,6 +90,7 @@ export const Plugin = define({
           { action: "read", resource: "*.env.example", effect: "allow" },
           { action: "subagent", resource: "*", effect: "deny" },
           { action: "external_directory", resource: "*", effect: "allow" },
+          { action: "collaboration_send_message", resource: "*", effect: "allow" },
         )
       })
 
