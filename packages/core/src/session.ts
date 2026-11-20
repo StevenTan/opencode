@@ -102,6 +102,7 @@ type CompactInput = Parameters<Session.Handle["compact"]>[0] & { sessionID: Sess
 type ForkInput = {
   sessionID: SessionSchema.ID
   before?: SessionMessage.ID
+  subagent?: NonNullable<(typeof SessionEvent.Forked.Type)["data"]["subagent"]>
 }
 
 export {
@@ -379,6 +380,7 @@ const layer = Layer.effect(
             parentID: parent.id,
             boundary: { type: input.before ? "before" : "through", messageID: boundary.id },
             ...inherited,
+            subagent: input.subagent,
           })
           .pipe(Effect.provideService(SessionBlob.ForkMedia, media))
         const forked = yield* result.get(sessionID).pipe(Effect.orDie)

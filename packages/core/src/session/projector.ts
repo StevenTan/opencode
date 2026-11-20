@@ -163,7 +163,7 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
     .insert(SessionTable)
     .values({
       id: event.data.sessionID,
-      parent_id: null,
+      parent_id: event.data.subagent ? event.data.parentID : null,
       fork_session_id: event.data.parentID,
       fork_boundary: event.data.boundary,
       project_id: parent.project_id,
@@ -171,9 +171,9 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
       slug: Slug.create(),
       directory: parent.directory,
       path: parent.path,
-      title: forkTitle(parent.title ?? undefined),
-      agent: parent.agent,
-      model: parent.model,
+      title: event.data.subagent?.title ?? forkTitle(parent.title ?? undefined),
+      agent: event.data.subagent?.agent ?? parent.agent,
+      model: event.data.subagent?.model ?? parent.model,
       metadata: parent.metadata,
       permission: parent.permission,
       version: parent.version,
@@ -308,7 +308,28 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
 
     cursor = rows.at(-1)!.seq
   }
-  if (copiedSeq !== undefined) yield* Bus.reserveSequence(db, event.data.sessionID, copiedSeq)
+  if (event.data.subagent?.prefix) {
+    const prefix = event.data.subagent.prefix
+    const { id: _, type, ...encoded } = prefix
+    const messageID = forkedID(boundary.seq)
+    const data = media ? yield* SessionBlob.externalizeRow(db, encoded) : encoded
+    yield* db
+      .insert(SessionMessageTable)
+      .values({
+        id: messageID,
+        session_id: event.data.sessionID,
+        type,
+        seq: boundary.seq,
+        time_created: prefix.time.created,
+        time_updated: event.created,
+        data,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* SessionBlob.recordRefs(db, { sessionID: event.data.sessionID, messageID, seq: boundary.seq }, data)
+  }
+  const lastSeq = event.data.subagent?.prefix ? boundary.seq : copiedSeq
+  if (lastSeq !== undefined) yield* Bus.reserveSequence(db, event.data.sessionID, lastSeq)
   if (event.data.instructions)
     yield* InstructionState.initialize(db, event.data.sessionID, event.durable.seq, event.data.instructions)
 })

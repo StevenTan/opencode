@@ -3,7 +3,7 @@ export * as SubagentTool from "./subagent.js"
 import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
-import { Effect, Predicate, Schema } from "effect"
+import { DateTime, Effect, Predicate, Schema } from "effect"
 import { Agent } from "../../agent.js"
 import { Config } from "../../config.js"
 import { Job } from "../../job.js"
@@ -12,6 +12,7 @@ import { Permission } from "../../permission.js"
 import { Session } from "../../session.js"
 import { SessionSchema } from "../../session/schema.js"
 import { SubagentJob } from "../../session/subagent-job.js"
+import { SessionMessage } from "../../session/message.js"
 
 export const name = "subagent"
 
@@ -40,6 +41,12 @@ export const Input = Schema.Struct({
   sessionID: Schema.optionalKey(SessionSchema.ID).annotate({
     description: "Send a follow-up to an existing subagent, running or finished. Omit to start a new one.",
   }),
+  fork_turns: Schema.Literals(["all", "none"])
+    .pipe(Schema.withDecodingDefaultKey(Effect.succeed("all" as const)))
+    .annotate({
+      description:
+        "Parent history to inherit for a new child. Defaults to all, including recorded content before this call in the current assistant message. Use none for fresh context. Existing children retain their own history.",
+    }),
 })
 
 export const Output = Schema.Struct({
@@ -51,7 +58,7 @@ export const description = [
   "Spawns an agent in a child session to work on the specified task.",
   "Subagents always run in the background: the call returns immediately with a sessionID, and you receive a `<subagent>` message each time the child goes idle, including after later work.",
   "Keep working on non-overlapping tasks, or briefly tell the user what you launched and end your response. Do not sleep, poll, or proactively check on the child's progress.",
-  "New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.",
+  "fork_turns defaults to all: new children inherit settled parent history, attachments, session instructions and recorded text, reasoning and completed tool results before this call. Use none for fresh context. The child's selected agent supplies its own agent instructions.",
   "Pass the returned sessionID to continue that specific child conversation. A follow-up to a running child joins its current run.",
 ].join("\n")
 
@@ -176,8 +183,50 @@ export const Plugin = {
               }
 
               const model = override ?? agent.model ?? parent.model
+              const inherited =
+                existing === undefined && input.fork_turns !== "none"
+                  ? yield* Effect.gen(function* () {
+                      const message = yield* sessions.message({ sessionID: parent.id, messageID: context.messageID })
+                      if (message?.type !== "assistant")
+                        return yield* new ToolFailure({
+                          message: "Subagent context boundary is not an assistant message",
+                        })
+                      const index = message.content.findIndex((part) => part.type === "tool" && part.id === context.id)
+                      if (index < 0)
+                        return yield* new ToolFailure({ message: "Subagent context tool call was not found" })
+                      const content = message.content
+                        .slice(0, index)
+                        .filter(
+                          (part) =>
+                            part.type !== "tool" || part.state.status === "completed" || part.state.status === "error",
+                        )
+                      const prefix =
+                        content.length === 0
+                          ? undefined
+                          : Schema.encodeSync(SessionMessage.Assistant)({
+                              id: message.id,
+                              type: "assistant",
+                              agent: message.agent,
+                              model: message.model,
+                              content,
+                              time: { created: message.time.created, completed: yield* DateTime.now },
+                            })
+                      return yield* sessions
+                        .fork({
+                          sessionID: parent.id,
+                          before: context.messageID,
+                          subagent: { title: input.description, agent: agent.id, model, prefix },
+                        })
+                        .pipe(
+                          Effect.mapError(
+                            (error) => new ToolFailure({ message: "Failed to inherit subagent context", error }),
+                          ),
+                        )
+                    })
+                  : undefined
               const child =
                 existing ??
+                inherited ??
                 (yield* sessions
                   .create({
                     parentID: context.sessionID,

@@ -30,6 +30,7 @@ import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionStore } from "@opencode/core/session/store"
+import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { SubagentJob } from "@opencode/core/session/subagent-job"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
@@ -144,6 +145,7 @@ const nodes = LayerNode.group([
   SessionExecution.node,
   LocationServiceMap.node,
   SessionStore.node,
+  InstructionEntry.node,
 ])
 const replacements = [
   SessionExecution.node.replace(executionNode),
@@ -222,6 +224,184 @@ const withSubagent = (location: Location.Ref) =>
   })
 
 describe("SubagentTool", () => {
+  it.live("inherits history and the settled assistant prefix with child ownership", () =>
+    tmpdirScoped().pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const bus = yield* Bus.Service
+          const { db } = yield* Database.Service
+          const parent = yield* sessions.create({
+            location: Location.Ref.make({ directory: AbsolutePath.make(dir.path) }),
+            model: parentModel,
+          })
+          yield* withSubagent(parent.location)
+          const locations = yield* LocationServiceMap.Service
+          const entries = yield* InstructionEntry.Service
+          yield* entries.put({ sessionID: parent.id, key: "context", value: "Inherited instruction" })
+          yield* sessions.prompt({
+            sessionID: parent.id,
+            text: "Parent task",
+            resume: false,
+            files: [
+              {
+                uri: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                name: "context.png",
+              },
+            ],
+          })
+          yield* SessionInbox.promote(db, bus, parent.id, "steer")
+          const assistantMessageID = SessionMessage.ID.create()
+          yield* bus.publish(SessionEvent.Step.Started, {
+            sessionID: parent.id,
+            assistantMessageID,
+            agent: toolIdentity.agent,
+            model: parentModel,
+            started: 0,
+          })
+          yield* bus.publish(SessionEvent.Text.Started, { sessionID: parent.id, assistantMessageID, ordinal: 0 })
+          yield* bus.publish(SessionEvent.Text.Ended, {
+            sessionID: parent.id,
+            assistantMessageID,
+            ordinal: 0,
+            text: "Current context",
+          })
+          yield* bus.publish(SessionEvent.Reasoning.Started, { sessionID: parent.id, assistantMessageID, ordinal: 1 })
+          yield* bus.publish(SessionEvent.Reasoning.Ended, {
+            sessionID: parent.id,
+            assistantMessageID,
+            ordinal: 1,
+            text: "Recorded reasoning",
+          })
+          for (const id of ["done", "pending", "spawn"]) {
+            yield* bus.publish(SessionEvent.Tool.Input.Started, {
+              sessionID: parent.id,
+              assistantMessageID,
+              id,
+              name: id === "spawn" ? "subagent" : "shell",
+            })
+            yield* bus.publish(SessionEvent.Tool.Input.Ended, {
+              sessionID: parent.id,
+              assistantMessageID,
+              id,
+              text: "{}",
+            })
+            yield* bus.publish(SessionEvent.Tool.Called, {
+              sessionID: parent.id,
+              assistantMessageID,
+              id,
+              input: {},
+              executed: true,
+            })
+            if (id === "done")
+              yield* bus.publish(SessionEvent.Tool.Success, {
+                sessionID: parent.id,
+                assistantMessageID,
+                id,
+                executed: true,
+                content: [{ type: "text", text: "Prior tool result" }],
+              })
+          }
+          yield* bus.publish(SessionEvent.Text.Started, { sessionID: parent.id, assistantMessageID, ordinal: 5 })
+          yield* bus.publish(SessionEvent.Text.Ended, {
+            sessionID: parent.id,
+            assistantMessageID,
+            ordinal: 5,
+            text: "After invocation",
+          })
+          const snapshot = yield* sessions.context(parent.id)
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
+          const inherited = yield* executeTool(registry, {
+            sessionID: parent.id,
+            ...toolIdentity,
+            messageID: assistantMessageID,
+            call: {
+              type: "tool-call",
+              id: "spawn",
+              name: SubagentTool.name,
+              input: { agent: "reviewer", description: "Inherited review", prompt: "Review the task" },
+            },
+          })
+          expect(inherited.status).toBe("completed")
+          const childID = outputSessionID(inherited.metadata)
+          expect(yield* sessions.get(childID)).toMatchObject({
+            parentID: parent.id,
+            agent: "reviewer",
+            model: childModel,
+            title: "Inherited review",
+            cost: 0,
+            tokens,
+          })
+          const history = yield* sessions.context(childID)
+          expect(history[0]).toMatchObject({ type: "user", text: "Parent task" })
+          if (snapshot[0].type === "user" && history[0].type === "user") {
+            expect(snapshot[0].files).toHaveLength(1)
+            expect(history[0].files).toEqual(snapshot[0].files)
+          }
+          expect(history[0].id).not.toBe(snapshot[0].id)
+          expect(history[1]).toMatchObject({
+            type: "assistant",
+            content: [
+              { type: "text", text: "Current context" },
+              { type: "reasoning", text: "Recorded reasoning" },
+              {
+                type: "tool",
+                id: "done",
+                state: { status: "completed", content: [{ type: "text", text: "Prior tool result" }] },
+              },
+            ],
+          })
+          if (history[1].type === "assistant") expect(history[1].time.completed).toBeDefined()
+          expect(yield* entries.list(childID)).toEqual([{ key: "context", value: "Inherited instruction" }])
+          expect(yield* sessions.message({ sessionID: parent.id, messageID: assistantMessageID })).toEqual(
+            snapshot.find((message) => message.id === assistantMessageID),
+          )
+          const fresh = yield* executeTool(registry, {
+            sessionID: parent.id,
+            ...toolIdentity,
+            messageID: assistantMessageID,
+            call: {
+              type: "tool-call",
+              id: "fresh",
+              name: SubagentTool.name,
+              input: { agent: "reviewer", description: "Fresh review", prompt: "Fresh task", fork_turns: "none" },
+            },
+          })
+          const freshID = outputSessionID(fresh.metadata)
+          expect(
+            (yield* sessions.context(freshID)).some(
+              (message) => message.type === "user" && message.text === "Parent task",
+            ),
+          ).toBe(false)
+          expect(yield* entries.list(freshID)).toEqual([])
+          const continued = yield* executeTool(registry, {
+            sessionID: parent.id,
+            ...toolIdentity,
+            messageID: assistantMessageID,
+            call: {
+              type: "tool-call",
+              id: "continue",
+              name: SubagentTool.name,
+              input: {
+                agent: "reviewer",
+                description: "Continue review",
+                prompt: "Continue",
+                sessionID: childID,
+                fork_turns: "all",
+              },
+            },
+          })
+          expect(outputSessionID(continued.metadata)).toBe(childID)
+          expect(
+            (yield* sessions.context(childID)).filter(
+              (message) => message.type === "user" && message.text === "Parent task",
+            ),
+          ).toHaveLength(1)
+        }),
+      ),
+    ),
+  )
+
   completionIt.live("admits one durable completion across live delivery and restart replay", () =>
     tmpdirScoped().pipe(
       Effect.flatMap((dir) =>
@@ -257,7 +437,7 @@ describe("SubagentTool", () => {
               type: "tool-call",
               id: "call-completion-replay",
               name: SubagentTool.name,
-              input: { agent: "reviewer", description: "background review", prompt: "review" },
+              input: { fork_turns: "none", agent: "reviewer", description: "background review", prompt: "review" },
             },
           })
           const marker = yield* Deferred.await(admitted)
@@ -328,7 +508,7 @@ describe("SubagentTool", () => {
                 type: "tool-call",
                 id: "call-primary",
                 name: SubagentTool.name,
-                input: { agent: "primary", description: "primary", prompt: "should fail" },
+                input: { fork_turns: "none", agent: "primary", description: "primary", prompt: "should fail" },
               },
             }),
           ).toEqual({
@@ -360,7 +540,7 @@ describe("SubagentTool", () => {
                 type: "tool-call",
                 id: "call-nested-subagent",
                 name: SubagentTool.name,
-                input: { agent: "reviewer", description: "nested", prompt: "should fail" },
+                input: { fork_turns: "none", agent: "reviewer", description: "nested", prompt: "should fail" },
               },
             }),
           ).toEqual({
@@ -398,7 +578,7 @@ describe("SubagentTool", () => {
               type: "tool-call",
               id: "call-configured-nested-subagent",
               name: SubagentTool.name,
-              input: { agent: "reviewer", description: "nested", prompt: "should run" },
+              input: { fork_turns: "none", agent: "reviewer", description: "nested", prompt: "should run" },
             },
           })
 
@@ -438,7 +618,14 @@ describe("SubagentTool", () => {
               type: "tool-call",
               id: "call-subagent",
               name: SubagentTool.name,
-              input: { agent: "reviewer", description: "review", prompt: "review this", model: "", sessionID: "" },
+              input: {
+                fork_turns: "none",
+                agent: "reviewer",
+                description: "review",
+                prompt: "review this",
+                model: "",
+                sessionID: "",
+              },
             },
           })
 
@@ -470,7 +657,7 @@ describe("SubagentTool", () => {
               type: "tool-call",
               id: "call-subagent-fallback",
               name: SubagentTool.name,
-              input: { agent: "fallback", description: "fallback", prompt: "fallback" },
+              input: { fork_turns: "none", agent: "fallback", description: "fallback", prompt: "fallback" },
             },
           })
           const fallbackChild = yield* sessions.get(outputSessionID(fallback.metadata))
@@ -498,7 +685,7 @@ describe("SubagentTool", () => {
               type: "tool-call",
               id: "call-subagent-first",
               name: SubagentTool.name,
-              input: { agent: "reviewer", description: "review", prompt: "review this" },
+              input: { fork_turns: "none", agent: "reviewer", description: "review", prompt: "review this" },
             },
           })
           const childID = outputSessionID(first.metadata)
@@ -510,6 +697,7 @@ describe("SubagentTool", () => {
               id: "call-subagent-second",
               name: SubagentTool.name,
               input: {
+                fork_turns: "none",
                 agent: "reviewer",
                 description: "follow up",
                 prompt: "continue this",
@@ -564,6 +752,7 @@ describe("SubagentTool", () => {
               id: "call-running-subagent",
               name: SubagentTool.name,
               input: {
+                fork_turns: "none",
                 agent: "reviewer",
                 description: "follow up",
                 prompt: "continue while running",
@@ -615,7 +804,7 @@ describe("SubagentTool", () => {
                 type: "tool-call",
                 id,
                 name: SubagentTool.name,
-                input: { agent: "reviewer", description: "review", prompt: id, ...input },
+                input: { fork_turns: "none", agent: "reviewer", description: "review", prompt: id, ...input },
               },
             }).pipe(Effect.timeout("2 seconds"))
 
@@ -672,7 +861,7 @@ describe("SubagentTool", () => {
                 type: "tool-call" as const,
                 id,
                 name: SubagentTool.name,
-                input: { agent, description: "follow up", prompt: "continue", sessionID },
+                input: { fork_turns: "none", agent, description: "follow up", prompt: "continue", sessionID },
               },
             })
 
@@ -692,7 +881,13 @@ describe("SubagentTool", () => {
                 type: "tool-call",
                 id: "call-malformed-child-id",
                 name: SubagentTool.name,
-                input: { agent: "reviewer", description: "follow up", prompt: "continue", sessionID: "placeholder" },
+                input: {
+                  fork_turns: "none",
+                  agent: "reviewer",
+                  description: "follow up",
+                  prompt: "continue",
+                  sessionID: "placeholder",
+                },
               },
             }),
           ).toMatchObject({
@@ -755,7 +950,13 @@ describe("SubagentTool", () => {
                 type: "tool-call" as const,
                 id,
                 name: SubagentTool.name,
-                input: { agent: "reviewer", description: "review", prompt: "review this", ...input },
+                input: {
+                  fork_turns: "none",
+                  agent: "reviewer",
+                  description: "review",
+                  prompt: "review this",
+                  ...input,
+                },
               },
             })
 
@@ -839,7 +1040,7 @@ describe("SubagentTool", () => {
               type: "tool-call",
               id: "call-background-subagent",
               name: SubagentTool.name,
-              input: { agent: "reviewer", description: "background review", prompt: "review" },
+              input: { fork_turns: "none", agent: "reviewer", description: "background review", prompt: "review" },
             },
           })
           const childID = outputSessionID(settled.metadata)
@@ -893,7 +1094,7 @@ const reportingFixture = () =>
           type: "tool-call" as const,
           id,
           name: SubagentTool.name,
-          input: { agent: "reviewer", description: "review", prompt: "review this", ...input },
+          input: { fork_turns: "none", agent: "reviewer", description: "review", prompt: "review this", ...input },
         },
       })
     // A notice is either still queued or already delivered to the parent; count both.

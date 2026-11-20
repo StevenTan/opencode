@@ -201,6 +201,12 @@ export const Forked = Event.durable({
     boundary: SessionFork.Boundary,
     instructions: Instruction.Values.pipe(optional),
     instructionEntries: InstructionEntry.Snapshot.pipe(optional),
+    subagent: Schema.Struct({
+      title: Schema.String,
+      agent: Agent.ID,
+      model: Model.Ref.pipe(optional),
+      prefix: Schema.toEncoded(SessionMessage.Assistant).pipe(optional),
+    }).pipe(optional),
   },
 })
 export type Forked = typeof Forked.Type
